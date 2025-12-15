@@ -4,9 +4,10 @@ This is a basic implementation of a DBC (Database Client) file editor for World 
 ## Features
 - Load DBC files and parse their structure.
 - Export DBC data to CSV format.
-- (Planned) Modify records and save changes back to DBC format.
-- (Planned) Add or remove records.
+- Modify records and save changes back to DBC format.
+- Add or remove records.
 - Handle various data types including integers, floats, and strings.
+- Save modified data back to DBC files.
 
 ## Developed By 
 - [MasterkinG32](https://github.com/masterking32)

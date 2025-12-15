@@ -18,6 +18,7 @@ class MasterDBC_Editor
             throw new Exception("DBC file not found: " . $dbcFilePath);
         }
 
+        // TODO: Support CSV Loading
         $this->dbcFilePath = $dbcFilePath;
         $this->load_dbc();
     }
@@ -134,6 +135,40 @@ class MasterDBC_Editor
             throw new Exception("Unsupported data type: " . $type);
         }
     }
+
+    private function write_data($type, $value)
+    {
+        $data = '';
+        if (preg_match('/^std::array<(.+?),\s*(\d+)>$/', $type, $matches)) {
+            $elementType = trim($matches[1]);
+            foreach ($value as $element) {
+                $data .= $this->write_data($elementType, $element);
+            }
+        } elseif ($type === 'flag96') {
+            foreach ($value as $part) {
+                $data .= pack('V', $part);
+            }
+        } elseif (in_array($type, ['uint32', 'int32'])) {
+            $format = ($type === 'uint32') ? 'V' : 'l';
+            $data .= pack($format, $value);
+        } elseif (in_array($type, ['uint16', 'int16'])) {
+            $format = ($type === 'uint16') ? 'v' : 's';
+            $data .= pack($format, $value);
+        } elseif (in_array($type, ['uint8', 'int8'])) {
+            $format = ($type === 'uint8') ? 'C' : 'c';
+            $data .= pack($format, $value);
+        } elseif (in_array($type, ['uint64', 'int64'])) {
+            $format = ($type === 'uint64') ? 'P' : 'q';
+            $data .= pack($format, $value);
+        } elseif (in_array($type, ['float', 'double'])) {
+            $format = ($type === 'double') ? 'd' : 'f';
+            $data .= pack($format, $value);
+        } else {
+            throw new Exception("Unsupported data type for writing: " . $type);
+        }
+        return $data;
+    }
+
     private function read_int($data, &$offset, $uint = true, $int_type = 32)
     {
         if ($int_type === 32) {
@@ -220,9 +255,39 @@ class MasterDBC_Editor
         fclose($file);
     }
 
-    // TODO: Implement save_to_dbc() method to write back to DBC format
-    // TODO: Implement methods to modify records
-    // TODO: Implement methods to add/remove records
+    public function save_to_dbc($outputFilePath)
+    {
+        if (!is_array($this->dbc_records) || empty($this->dbc_records)) {
+            throw new Exception("No records to save.");
+        }
+
+        $file = fopen($outputFilePath, 'w+b');
+        if (!$file) {
+            throw new Exception("Failed to open output DBC file: " . $outputFilePath);
+        }
+
+        $headerData = pack(
+            'V5',
+            0x43424457, // 'WDBC'
+            count($this->dbc_records),
+            count($this->definition),
+            $this->dbc_header['record_size'],
+            0 // Placeholder for string block size
+        );
+
+        fwrite($file, $headerData);
+
+        foreach ($this->dbc_records as $record) {
+            $recordData = '';
+            foreach ($this->definition as $field) {
+                $type = $field[0];
+                $name = $field[1];
+                $recordData .= $this->write_data($type, $record[$name]);
+            }
+            fwrite($file, $recordData);
+        }
+        fclose($file);
+    }
 
     public function __destruct()
     {
