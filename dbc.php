@@ -18,9 +18,46 @@ class MasterDBC_Editor
             throw new Exception("DBC file not found: " . $dbcFilePath);
         }
 
-        // TODO: Support CSV Loading
         $this->dbcFilePath = $dbcFilePath;
-        $this->load_dbc();
+        if (strtolower(substr($dbcFilePath, -4)) === '.dbc') {
+            $this->load_dbc();
+        } elseif (strtolower(substr($dbcFilePath, -4)) === '.csv') {
+            $this->load_csv();
+        } else {
+            throw new Exception("Unsupported file format: " . $dbcFilePath);
+        }
+    }
+
+    private function load_csv()
+    {
+        $fileName = str_replace('.csv', '', basename($this->dbcFilePath));
+        include __DIR__ . '/definition.php';
+        if (!isset($definition[$fileName])) {
+            throw new Exception("No definition found for CSV file: " . $fileName);
+        }
+
+        $this->definition = $definition[$fileName];
+        $this->dbc_records = [];
+        if (($handle = fopen($this->dbcFilePath, 'r')) !== false) {
+            $headers = fgetcsv($handle);
+            while (($data = fgetcsv($handle)) !== false) {
+                $record = [];
+                foreach ($headers as $index => $header) {
+                    $value = $data[$index];
+                    // Decode JSON arrays
+                    $decodedValue = json_decode($value, true);
+                    if (json_last_error() === JSON_ERROR_NONE) {
+                        $record[$header] = $decodedValue;
+                    } else {
+                        $record[$header] = $value;
+                    }
+                }
+                $this->dbc_records[] = $record;
+            }
+            fclose($handle);
+        } else {
+            throw new Exception("Failed to open CSV file: " . $this->dbcFilePath);
+        }
     }
 
     private function load_dbc()
@@ -136,13 +173,13 @@ class MasterDBC_Editor
         }
     }
 
-    private function write_data($type, $value)
+    private function write_data($type, $value, &$stringBlock, &$stringOffsets)
     {
         $data = '';
         if (preg_match('/^std::array<(.+?),\s*(\d+)>$/', $type, $matches)) {
             $elementType = trim($matches[1]);
             foreach ($value as $element) {
-                $data .= $this->write_data($elementType, $element);
+                $data .= $this->write_data($elementType, $element, $stringBlock, $stringOffsets);
             }
         } elseif ($type === 'flag96') {
             foreach ($value as $part) {
@@ -163,10 +200,39 @@ class MasterDBC_Editor
         } elseif (in_array($type, ['float', 'double'])) {
             $format = ($type === 'double') ? 'd' : 'f';
             $data .= pack($format, $value);
+        } elseif (preg_match('/^char const\*\[(\d+)\]$/', $type, $matches)) {
+            // String array
+            $length = (int)$matches[1];
+            $stringValue = is_string($value) ? $value : '';
+            for ($i = 0; $i < $length; $i++) {
+                $offset = $this->add_to_string_block($stringValue, $stringBlock, $stringOffsets);
+                $data .= pack('V', $offset);
+            }
+        } elseif (in_array($type, ['char const*', 'string'])) {
+            // Single string
+            $stringValue = is_string($value) ? $value : '';
+            $offset = $this->add_to_string_block($stringValue, $stringBlock, $stringOffsets);
+            $data .= pack('V', $offset);
+        } elseif ($type === 'DBCPosition2D') {
+            $data .= pack('f', $value['x'] ?? 0.0);
+            $data .= pack('f', $value['y'] ?? 0.0);
+        } elseif ($type === 'DBCPosition3D') {
+            $data .= pack('f', $value['x'] ?? 0.0);
+            $data .= pack('f', $value['y'] ?? 0.0);
+            $data .= pack('f', $value['z'] ?? 0.0);
         } else {
             throw new Exception("Unsupported data type for writing: " . $type);
         }
         return $data;
+    }
+
+    private function add_to_string_block($string, &$stringBlock, &$stringOffsets)
+    {
+        if (!isset($stringOffsets[$string])) {
+            $stringOffsets[$string] = strlen($stringBlock);
+            $stringBlock .= $string . "\0";
+        }
+        return $stringOffsets[$string];
     }
 
     private function read_int($data, &$offset, $uint = true, $int_type = 32)
@@ -266,27 +332,94 @@ class MasterDBC_Editor
             throw new Exception("Failed to open output DBC file: " . $outputFilePath);
         }
 
-        $headerData = pack(
-            'V5',
-            0x43424457, // 'WDBC'
-            count($this->dbc_records),
-            count($this->definition),
-            $this->dbc_header['record_size'],
-            0 // Placeholder for string block size
-        );
+        $recordSize = $this->dbc_header['record_size'] ?? $this->calculate_record_size();
 
-        fwrite($file, $headerData);
+        $stringBlock = "\0";
+        $stringOffsets = ['' => 0];
 
+        $allRecordData = '';
         foreach ($this->dbc_records as $record) {
             $recordData = '';
             foreach ($this->definition as $field) {
                 $type = $field[0];
                 $name = $field[1];
-                $recordData .= $this->write_data($type, $record[$name]);
+                $value = isset($record[$name]) ? $record[$name] : null;
+                $recordData .= $this->write_data($type, $value, $stringBlock, $stringOffsets);
             }
-            fwrite($file, $recordData);
+            $allRecordData .= $recordData;
         }
+
+        $headerData = pack(
+            'V5',
+            0x43424457, // 'WDBC'
+            count($this->dbc_records),
+            count($this->definition),
+            $recordSize,
+            strlen($stringBlock)
+        );
+
+        fwrite($file, $headerData);
+        fwrite($file, $allRecordData);
+        fwrite($file, $stringBlock);
+
         fclose($file);
+    }
+
+    private function calculate_record_size()
+    {
+        $size = 0;
+        foreach ($this->definition as $field) {
+            $type = $field[0];
+            $size += $this->get_type_size($type);
+        }
+        return $size;
+    }
+
+    private function get_type_size($type)
+    {
+        if (preg_match('/^std::array<(.+?),\s*(\d+)>$/', $type, $matches)) {
+            $elementType = trim($matches[1]);
+            $arraySize = (int)$matches[2];
+            return $this->get_type_size($elementType) * $arraySize;
+        }
+
+        if ($type === 'flag96') {
+            return 12; // 3 * 4 bytes
+        }
+
+        if (preg_match('/^char const\*\[(\d+)\]$/', $type, $matches)) {
+            $arraySize = (int)$matches[1];
+            return 4 * $arraySize; // Each string is a 4-byte offset
+        }
+
+        $sizeMap = [
+            'uint32' => 4,
+            'int32' => 4,
+            'uint16' => 2,
+            'int16' => 2,
+            'uint8' => 1,
+            'int8' => 1,
+            'uint64' => 8,
+            'int64' => 8,
+            'float' => 4,
+            'double' => 8,
+            'char const*' => 4,
+            'string' => 4
+        ];
+
+        if (isset($sizeMap[$type])) {
+            return $sizeMap[$type];
+        }
+
+        if ($type === 'DBCPosition2D') {
+            return 8; // 2 floats
+        }
+
+        if ($type === 'DBCPosition3D') {
+            return 12; // 3 floats
+        }
+
+        throw new Exception("Unable to calculate size for type: " . $type);
     }
 
     public function __destruct()
